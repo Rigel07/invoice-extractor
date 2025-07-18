@@ -29,21 +29,11 @@ function App() {
     try {
       const response = await axios.post("http://127.0.0.1:8000/extract-details/", formData);
       
-      const rawResponse = response.data.extracted_data;
-      console.log("Raw response from AI:", rawResponse); // For debugging
-
-      // --- ROBUST JSON PARSING ---
-      // Find the start and end of the JSON object within the raw text
-      const jsonStartIndex = rawResponse.indexOf('{');
-      const jsonEndIndex = rawResponse.lastIndexOf('}');
-
-      if (jsonStartIndex !== -1 && jsonEndIndex !== -1) {
-        const jsonString = rawResponse.substring(jsonStartIndex, jsonEndIndex + 1);
-        const parsedData = JSON.parse(jsonString);
-        setExtractedData(parsedData);
+      // Check if the response has the expected structure
+      if (response.data && response.data.success && response.data.data) {
+        setExtractedData(response.data.data);
       } else {
-        // If no '{' or '}' is found, the response is not what we expected.
-        setError("The AI did not return a valid data object.");
+        setError("Invalid response from API.");
       }
 
     } catch (err) {
@@ -105,6 +95,8 @@ function App() {
       {extractedData && (
         <div className="results-container">
           <h2>Extracted Details</h2>
+          
+          {/* Processing Information */}
           <div className="details-grid">
             {Object.entries(extractedData).map(([key, value]) => (
               <div key={key} className="detail-item">

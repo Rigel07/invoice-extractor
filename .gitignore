@@ -89,3 +89,9 @@ jspm_packages/
 # Build outputs
 dist/
 build/
+.next/
+out/
+
+# Production deployment files
+*.log
+*.pid
