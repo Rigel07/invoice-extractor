@@ -1,0 +1,84 @@
+main {
+  display: flex;
+  flex-direction: column;
+  margin: 0 auto;
+  align-items: center;
+  height: 100vh;
+}
+
+h1 {
+  font-size: 2.5rem;
+  margin: 20px 0;
+  color: #fff;
+}
+
+span {
+  display: block;
+  font-size: 20px;
+  margin: 10px 0;
+}
+
+input[type="file"] {
+  display: none;
+}
+
+.custom-filePicker {
+  border: 3px dashed #ccc;
+  display: inline-block;
+  padding: 50px 100px;
+  cursor: pointer;
+}
+
+.btn {
+  background-color: #4CAF50;
+  color: white;
+  padding: 10px 20px;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 16px;
+  margin-top: 20px;
+  width: 303px;
+}
+
+.btn:hover {
+  background-color: #45a049;
+}
+
+.results-container {
+  display: flex;
+  flex-direction: column;
+  width: 500px;
+  text-align: center;
+  font-size: 18px;
+}
+
+.details-grid {
+  margin: 0 auto;
+}
+
+.detail-item {
+  display: flex;
+}
+
+.detail-key {
+  font-weight: bold;
+  font-size: 16px;
+}
+
+.detail-value {
+  margin-left: 10px;
+  font-size: 16px;
+}
+
+.btn-copy {
+  background-color: #008CBA;
+  color: white;
+  padding: 10px 20px;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 16px;
+  margin: 0 auto;
+  width: fit-content;
+}
