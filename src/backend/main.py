@@ -4,8 +4,13 @@ import os
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 import json
+import csv
+from typing import List
+import zipfile
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -155,3 +160,103 @@ async def extract_invoice_details(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+def process_single_file(file_content: bytes, filename: str, content_type: str) -> dict:
+    """Process a single file and return extracted data with filename"""
+    try:
+        # Prepare content for AI
+        if "image" in content_type:
+            image = Image.open(io.BytesIO(file_content))
+            image = optimize_image(image)
+            prompt_parts = [EXTRACTION_PROMPT, image]
+        elif "pdf" in content_type:
+            prompt_parts = [EXTRACTION_PROMPT, {"mime_type": content_type, "data": file_content}]
+        else:
+            return {"filename": filename, "error": "Unsupported file type"}
+        
+        # Generate content
+        response = model.generate_content(prompt_parts)
+        
+        # Parse response
+        extracted_data = parse_response(response.text)
+        
+        # Add filename to the data
+        extracted_data["filename"] = filename
+        
+        return extracted_data
+        
+    except Exception as e:
+        return {"filename": filename, "error": str(e)}
+
+def create_csv_from_data(data_list: List[dict]) -> str:
+    """Create CSV content from list of extracted data"""
+    if not data_list:
+        return ""
+    
+    # Define CSV headers
+    headers = [
+        "filename", "party_name", "party_gstin", "tax_invoice_no", 
+        "invoice_date", "taxable_value", "cgst", "sgst", "igst", 
+        "invoice_value", "error"
+    ]
+    
+    # Create CSV content
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers)
+    writer.writeheader()
+    
+    for data in data_list:
+        # Ensure all required fields are present
+        row = {}
+        for header in headers:
+            row[header] = data.get(header, "")
+        writer.writerow(row)
+    
+    return output.getvalue()
+
+@app.post("/bulk-extract/")
+async def bulk_extract_invoices(files: List[UploadFile] = File(...)):
+    """Extract details from multiple invoice files and return CSV"""
+    
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    if len(files) > 20:  # Limit to 20 files
+        raise HTTPException(status_code=400, detail="Too many files. Maximum 20 files allowed.")
+    
+    results = []
+    
+    # Process each file
+    for file in files:
+        try:
+            # Validate file
+            validate_file(file)
+            
+            # Check file size
+            contents = await file.read()
+            if len(contents) > MAX_FILE_SIZE:
+                results.append({
+                    "filename": file.filename,
+                    "error": f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.1f}MB"
+                })
+                continue
+            
+            # Process the file
+            result = process_single_file(contents, file.filename, file.content_type)
+            results.append(result)
+            
+        except Exception as e:
+            results.append({
+                "filename": file.filename or "unknown",
+                "error": str(e)
+            })
+    
+    # Create CSV content
+    csv_content = create_csv_from_data(results)
+    
+    # Return CSV as downloadable file
+    return StreamingResponse(
+        io.StringIO(csv_content),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=invoice_extraction_results.csv"}
+    )

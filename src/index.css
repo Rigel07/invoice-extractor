@@ -13,4 +13,23 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Color Variables */
+  --primary-green: #4CAF50;
+  --primary-green-hover: #45a049;
+  --primary-blue: #008CBA;
+  --primary-blue-hover: #007b9a;
+  
+  /* Text Colors */
+  --text-white: #ffffff;
+  --text-light: #cccccc;
+  --text-muted: #666666;
+  
+  /* Border Colors */
+  --border-light: #555555;
+  --border-muted: #cccccc;
+  
+  /* Background Colors */
+  --bg-hover: rgba(255, 255, 255, 0.05);
+  --bg-delete-hover: rgba(255, 235, 238, 0.1);
 }
