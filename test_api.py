@@ -19,22 +19,35 @@ async def test_health_check():
             return response.status == 200
 
 async def test_provider_status():
-    """Test the provider status endpoint"""
+    """Test the model status endpoint"""
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"{API_BASE_URL}/providers") as response:
+        async with session.get(f"{API_BASE_URL}/models") as response:
             data = await response.json()
-            print(f"📊 Providers: {data['available_count']}/{data['total_count']} available")
+            available_models = data['available_count']
+            total_models = data['total_count']
+            print(f"📊 Models: {available_models}/{total_models} available")
             
-            for provider in data['providers']:
-                status = "✅" if provider['available'] else "❌"
-                print(f"  {status} {provider['name']} - Retries: {provider['retry_count']}/{provider['max_retries']}")
+            for model in data['models']:
+                status = "✅" if model['available'] else "❌"
+                print(f"  {status} {model['name']} - Retries: {model['retry_count']}/{model['max_retries']}")
             
-            return data['available_count'] > 0
+            return available_models > 0
 
 async def test_file_extraction():
-    """Test file extraction with a sample file"""
-    # Create a simple test image (1x1 pixel PNG)
-    test_image_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\tpHYs\x00\x00\x0b\x13\x00\x00\x0b\x13\x01\x00\x9a\x9c\x18\x00\x00\x00\x0eIDATx\x9cc\xf8\x0f\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00IEND\xaeB`\x82'
+    """Test file extraction with a proper sample file"""
+    # Use the proper test image we created
+    try:
+        with open('test_invoice_proper.png', 'rb') as f:
+            test_image_data = f.read()
+    except FileNotFoundError:
+        print("❌ Test image not found, creating a simple one...")
+        # Create a minimal but valid PNG
+        from PIL import Image
+        import io
+        img = Image.new('RGB', (100, 100), color='white')
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        test_image_data = buffer.getvalue()
     
     data = aiohttp.FormData()
     data.add_field('file', test_image_data, filename='test.png', content_type='image/png')
@@ -44,6 +57,7 @@ async def test_file_extraction():
             if response.status == 200:
                 result = await response.json()
                 print(f"✅ File extraction successful: {result['success']}")
+                print(f"📊 Extracted data fields: {len(result.get('data', {}))}")
                 return True
             else:
                 error = await response.text()
@@ -51,11 +65,11 @@ async def test_file_extraction():
                 return False
 
 async def test_reset_providers():
-    """Test resetting provider retry counts"""
+    """Test resetting model retry counts"""
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{API_BASE_URL}/reset-providers") as response:
+        async with session.post(f"{API_BASE_URL}/reset-models") as response:
             data = await response.json()
-            print(f"🔄 Reset providers: {data['message']}")
+            print(f"🔄 Reset models: {data['message']}")
             return response.status == 200
 
 async def main():
@@ -64,9 +78,9 @@ async def main():
     
     tests = [
         ("Health Check", test_health_check),
-        ("Provider Status", test_provider_status),
+        ("Model Status", test_provider_status),
         ("File Extraction", test_file_extraction),
-        ("Reset Providers", test_reset_providers),
+        ("Reset Models", test_reset_providers),
     ]
     
     results = []

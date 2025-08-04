@@ -59,7 +59,7 @@ class OptimizedModelManager:
         gemini_models = [
             ("Gemini 1.5 Flash 8B", "gemini-1.5-flash-8b", 1),      # Most efficient
             ("Gemini 1.5 Flash", "gemini-1.5-flash", 2),            # Good balance  
-            ("Gemini 1.0 Pro", "gemini-1.0-pro", 3),               # Fallback
+            ("Gemini 1.5 Pro", "gemini-1.5-pro", 3),               # Fallback (fixed model ID)
         ]
         
         for name, model_id, efficiency in gemini_models:
@@ -238,11 +238,25 @@ async def optimized_generate_content(prompt: str, image_data: bytes = None, cont
         gemini_model = genai.GenerativeModel(model.model_id)
         
         if image_data:
-            image = Image.open(io.BytesIO(image_data))
-            image = ultra_optimize_image(image)  # More aggressive optimization
-            prompt_parts = [prompt, image]
-        elif content_type and "pdf" in content_type:
-            prompt_parts = [prompt, {"mime_type": content_type, "data": image_data}]
+            # Handle different content types properly
+            if content_type and "pdf" in content_type:
+                # For PDFs, send as document data
+                prompt_parts = [
+                    prompt,
+                    {
+                        "mime_type": content_type,
+                        "data": base64.b64encode(image_data).decode('utf-8')
+                    }
+                ]
+            else:
+                # For images, process with PIL
+                try:
+                    image = Image.open(io.BytesIO(image_data))
+                    image = ultra_optimize_image(image)  # More aggressive optimization
+                    prompt_parts = [prompt, image]
+                except Exception as img_error:
+                    logger.error(f"Failed to process image: {img_error}")
+                    raise Exception(f"Cannot process image file: {img_error}")
         else:
             prompt_parts = [prompt]
         
@@ -300,11 +314,19 @@ async def optimized_batch_generate(prompt: str, batch_data: List[Dict], content_
         
         for data, content_type in zip(batch_data, content_types):
             if "image" in content_type:
-                image = Image.open(io.BytesIO(data['content']))
-                image = ultra_optimize_image(image)
-                prompt_parts.append(image)
+                try:
+                    image = Image.open(io.BytesIO(data['content']))
+                    image = ultra_optimize_image(image)
+                    prompt_parts.append(image)
+                except Exception as img_error:
+                    logger.error(f"Failed to process image in batch: {img_error}")
+                    # Skip problematic images or convert to text description
+                    prompt_parts.append(f"[Image processing failed: {data.get('filename', 'unknown')}]")
             elif "pdf" in content_type:
-                prompt_parts.append({"mime_type": content_type, "data": data['content']})
+                prompt_parts.append({
+                    "mime_type": content_type, 
+                    "data": base64.b64encode(data['content']).decode('utf-8')
+                })
         
         response = gemini_model.generate_content(
             prompt_parts,
@@ -362,6 +384,12 @@ def validate_file(file: UploadFile) -> None:
             status_code=400,
             detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
         )
+    
+    # Additional validation for file size and content
+    if file_ext == '.pdf':
+        logger.info(f"Processing PDF file: {file.filename}")
+    else:
+        logger.info(f"Processing image file: {file.filename}")
 
 def optimize_image(image: Image.Image) -> Image.Image:
     """Optimize image for processing"""

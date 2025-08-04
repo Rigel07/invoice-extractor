@@ -35,15 +35,7 @@ def validate_environment():
         print("Please set these variables in your .env file or environment.")
         sys.exit(1)
     
-    # Check for optional fallback providers
-    optional_vars = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
-    available_fallbacks = [var for var in optional_vars if os.getenv(var)]
-    
-    if not available_fallbacks:
-        print("WARNING: No fallback AI providers configured.")
-        print("Consider setting OPENAI_API_KEY or ANTHROPIC_API_KEY for better reliability.")
-    else:
-        print(f"INFO: Fallback providers available: {', '.join(available_fallbacks)}")
+    print("✅ Environment validation passed - Google Gemini API configured")
 
 if __name__ == "__main__":
     setup_logging()
