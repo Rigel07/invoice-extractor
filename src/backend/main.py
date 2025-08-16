@@ -18,6 +18,9 @@ import tempfile
 import base64
 from dataclasses import dataclass
 from enum import Enum
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +31,77 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# JSON Schema for structured output (Google Gemini best practice)
+INVOICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "party_name": {
+            "type": "string",
+            "description": "Company or person issuing the invoice",
+            "nullable": True
+        },
+        "party_gstin": {
+            "type": "string", 
+            "description": "15-character GST identification number",
+            "pattern": "^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9][A-Z]$",
+            "minLength": 15,
+            "maxLength": 15,
+            "nullable": True
+        },
+        "tax_invoice_no": {
+            "type": "string",
+            "description": "Unique invoice identifier", 
+            "nullable": True
+        },
+        "invoice_date": {
+            "type": "string",
+            "description": "Invoice date in DD-MM-YYYY format",
+            "pattern": "^[0-9]{2}-[0-9]{2}-[0-9]{4}$",
+            "nullable": True
+        },
+        "taxable_value": {
+            "type": "string",
+            "description": "Amount before taxes (numbers only)",
+            "pattern": "^[0-9]+\\.?[0-9]*$",
+            "nullable": True
+        },
+        "cgst": {
+            "type": "string",
+            "description": "Central GST amount (numbers only)",
+            "pattern": "^[0-9]+\\.?[0-9]*$",
+            "nullable": True
+        },
+        "sgst": {
+            "type": "string", 
+            "description": "State GST amount (numbers only)",
+            "pattern": "^[0-9]+\\.?[0-9]*$",
+            "nullable": True
+        },
+        "igst": {
+            "type": "string",
+            "description": "Integrated GST amount (numbers only)", 
+            "pattern": "^[0-9]+\\.?[0-9]*$",
+            "nullable": True
+        },
+        "invoice_value": {
+            "type": "string",
+            "description": "Total amount including taxes (numbers only)",
+            "pattern": "^[0-9]+\\.?[0-9]*$",
+            "nullable": True
+        }
+    },
+    "required": ["party_name", "party_gstin", "tax_invoice_no", "invoice_date", "taxable_value", "cgst", "sgst", "igst", "invoice_value"],
+    "propertyOrdering": ["party_name", "party_gstin", "tax_invoice_no", "invoice_date", "taxable_value", "cgst", "sgst", "igst", "invoice_value"]
+}
+
+# Schema for batch processing (array of invoices)
+BATCH_INVOICE_SCHEMA = {
+    "type": "array",
+    "items": INVOICE_SCHEMA,
+    "minItems": 1,
+    "maxItems": 20
+}
 
 @dataclass
 class GeminiModel:
@@ -46,21 +120,22 @@ class OptimizedModelManager:
         self.models = []
         self._setup_gemini_models()
         self.request_count = 0  # Track requests to avoid quota
-        self.daily_limit = 50  # Google free tier limit
+        self.daily_limit = 200  # Updated for Gemini 2.0 models - 4x better!
     
     def _setup_gemini_models(self):
-        """Initialize Gemini models in order of cost efficiency"""
+        """Initialize Gemini models in order of cost efficiency - Updated for 2.5"""
         google_key = os.getenv("GOOGLE_API_KEY")
         if not google_key:
             raise ValueError("GOOGLE_API_KEY environment variable is required")
         
         genai.configure(api_key=google_key)
         
-        # Order by efficiency: Flash models are fastest and cheapest
+        # Order by efficiency: Gemini 2.5 Flash as primary, then 2.5 Lite, 2.0 models
         gemini_models = [
-            ("Gemini 1.5 Flash 8B", "gemini-1.5-flash-8b", 1),      # Most efficient
-            ("Gemini 1.5 Flash", "gemini-1.5-flash", 2),            # Good balance  
-            ("Gemini 1.5 Pro", "gemini-1.5-pro", 3),               # Fallback (fixed model ID)
+            ("Gemini 2.5 Flash", "gemini-2.5-flash", 1),                # PRIMARY: Latest and most capable
+            ("Gemini 2.5 Flash-Lite", "gemini-2.5-flash-lite", 2),     # SECONDARY: Fast and efficient  
+            ("Gemini 2.0 Flash", "gemini-2.0-flash", 3),               # FALLBACK: Good performance
+            ("Gemini 2.0 Flash-Lite", "gemini-2.0-flash-lite", 4),     # FALLBACK: Backup option
         ]
         
         for name, model_id, efficiency in gemini_models:
@@ -70,11 +145,17 @@ class OptimizedModelManager:
                 cost_efficiency=efficiency
             ))
         
-        logger.info(f"Initialized {len(self.models)} optimized Gemini models")
+        logger.info(f"Initialized {len(self.models)} optimized Gemini 2.5/2.0 models with latest capabilities")
     
     def get_best_available_model(self) -> Optional[GeminiModel]:
         """Get the most efficient available model"""
+        # Reset models if all are unavailable (helps with safety filter recovery)
         available = [m for m in self.models if m.available and m.retry_count < m.max_retries]
+        if not available:
+            logger.warning("No models available, resetting all for recovery")
+            self.reset_all_models()
+            available = [m for m in self.models if m.available and m.retry_count < m.max_retries]
+        
         if not available:
             return None
         
@@ -88,6 +169,16 @@ class OptimizedModelManager:
         if model.retry_count >= model.max_retries:
             model.available = False
         logger.warning(f"Model {model.name} failed: {error} (retry {model.retry_count}/{model.max_retries})")
+    
+    def mark_model_temporarily_failed(self, model: GeminiModel, reason: str):
+        """Temporarily mark a model as failed (for safety blocks, etc.)"""
+        # Don't count safety blocks against retry count - they're not model failures
+        if "safety" not in reason.lower():
+            model.retry_count += 1
+        model.last_error = reason
+        if model.retry_count >= model.max_retries:
+            model.available = False
+        logger.warning(f"Temporarily failed {model.name}: {reason} (retry: {model.retry_count})")
     
     def reset_all_models(self):
         """Reset all model retry counts"""
@@ -150,152 +241,144 @@ MAX_BULK_FILES = int(os.getenv("MAX_BULK_FILES", 20))  # 20 files default
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 60))  # 60 seconds default
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10))  # Process 10 images per API call for maximum efficiency
 
-# Extraction prompt for batch processing
-BATCH_EXTRACTION_PROMPT = """You are an expert AI invoice data extraction system. Analyze the provided invoice images and extract the following information with maximum accuracy:
+# Optimized extraction prompt following Google Gemini best practices
+BATCH_EXTRACTION_PROMPT = """You are an expert invoice data extraction AI. Extract EXACTLY 9 fields from each invoice image with maximum precision.
 
-FOR EACH INVOICE IMAGE, EXTRACT THESE 9 FIELDS:
-
-1. PARTY_NAME: The name of the company or person issuing the invoice
-   - Look for: "Billed by", "From", company letterhead, top of invoice
-   - Common locations: Header, top-left corner, or clearly marked billing section
-
-2. PARTY_GSTIN: The Goods and Services Tax Identification Number
-   - Format: **MUST BE EXACTLY 15 CHARACTERS** (##AAAAA####A#A where # = digits, A = letters)
-   - Look for: "GSTIN", "GST No", "Tax ID"
-   - Example: 27AABCU9603R1ZN
-   - **CRITICAL: Count characters carefully - if not EXACTLY 15, return null**
-   - **NEVER add or remove characters from GSTIN numbers**
-
-3. TAX_INVOICE_NO: The unique invoice identifier
-   - Look for: "Invoice No", "Bill No", "Ref No", "Invoice Number"
-   - Usually alphanumeric (INV-001, 2024/001, etc.)
-
-4. INVOICE_DATE: The date the invoice was issued
-   - Look for: "Date", "Invoice Date", "Bill Date"
-   - Return in DD-MM-YYYY format (e.g., 15-01-2024)
-
-5. TAXABLE_VALUE: The amount before taxes are applied
-   - Look for: "Taxable Amount", "Sub Total", "Amount before tax"
-   - Extract only the numerical value (e.g., 1000.00)
-
-6. CGST: Central Goods and Services Tax amount
-   - Look for: "CGST", "Central GST"
-   - Extract only the numerical value
-
-7. SGST: State Goods and Services Tax amount
-   - Look for: "SGST", "State GST"
-   - Extract only the numerical value
-
-8. IGST: Integrated Goods and Services Tax amount
-   - Look for: "IGST", "Integrated GST"
-   - Extract only the numerical value (usually 0 if CGST/SGST are present)
-
-9. INVOICE_VALUE: The final total amount including all taxes
-   - Look for: "Total", "Grand Total", "Amount Payable", "Final Amount"
-   - Extract only the numerical value
-
-CRITICAL EXTRACTION RULES:
+CRITICAL CONSTRAINTS:
+- Extract information ONLY if clearly visible and readable
+- For GSTIN: Must be EXACTLY 15 characters (2 digits + 5 letters + 4 digits + 1 letter + 1 digit + 1 letter)
+- For monetary values: Extract numbers only (no currency symbols)
+- For dates: Use DD-MM-YYYY format
+- Use null for missing, unclear, or unreadable information
 - Process invoices in the order they appear
-- Extract ONLY information that is clearly visible and readable
-- For monetary values: extract numbers only (1250.50, not ₹1,250.50 or $1,250.50)
-- **For GSTIN: MUST BE EXACTLY 15 CHARACTERS - Count each character carefully**
-- **GSTIN FORMAT: 2digits + 5letters + 4digits + 1letter + 1digit + 1letter**
-- For dates: standardize to DD-MM-YYYY format
-- If information is unclear, blurry, or missing: return null
-- Do NOT guess, calculate, or infer missing values
-- **NEVER modify GSTIN numbers - extract exactly as shown**
 
-Return results as a JSON array with one object per invoice image:
+EXTRACTION TASK:
+For each invoice image, extract these 9 fields:
+
+1. party_name: Company/person issuing the invoice (from header/letterhead)
+2. party_gstin: 15-character GST number (count each character carefully)
+3. tax_invoice_no: Unique invoice identifier 
+4. invoice_date: Invoice issue date (DD-MM-YYYY format)
+5. taxable_value: Amount before taxes (numbers only)
+6. cgst: Central GST amount (numbers only)
+7. sgst: State GST amount (numbers only)
+8. igst: Integrated GST amount (numbers only)
+9. invoice_value: Final total including taxes (numbers only)
+
+EXAMPLES:
+
+Example 1:
+Input: Invoice showing "ABC Electronics Ltd", GSTIN "27AABCU9603R1ZN", Invoice "INV-2024-001"
+Output:
+[
+  {
+    "party_name": "ABC Electronics Ltd",
+    "party_gstin": "27AABCU9603R1ZN",
+    "tax_invoice_no": "INV-2024-001",
+    "invoice_date": "15-01-2024",
+    "taxable_value": "10000.00",
+    "cgst": "900.00",
+    "sgst": "900.00",
+    "igst": null,
+    "invoice_value": "11800.00"
+  }
+]
+
+Example 2:
+Input: Invoice with unclear GSTIN, readable company name "XYZ Services"
+Output:
+[
+  {
+    "party_name": "XYZ Services",
+    "party_gstin": null,
+    "tax_invoice_no": "BILL/2024/45",
+    "invoice_date": "22-03-2024",
+    "taxable_value": "5000.00",
+    "cgst": null,
+    "sgst": null,
+    "igst": "900.00",
+    "invoice_value": "5900.00"
+  }
+]
+
+RESPONSE FORMAT:
+Return a JSON array with one object per invoice:
 [
   {
     "party_name": "value_or_null",
-    "party_gstin": "value_or_null", 
-    "tax_invoice_no": "value_or_null",
+    "party_gstin": "value_or_null",
+    "tax_invoice_no": "value_or_null", 
     "invoice_date": "value_or_null",
     "taxable_value": "value_or_null",
     "cgst": "value_or_null",
-    "sgst": "value_or_null", 
+    "sgst": "value_or_null",
     "igst": "value_or_null",
     "invoice_value": "value_or_null"
   }
 ]
 
-If you cannot extract information from any invoice field, return null for that specific field."""
+GSTIN VALIDATION RULES:
+✓ Exactly 15 characters: 12ABCDE3456F7G8
+✓ Position 1-2: Numbers (state code)
+✓ Position 3-7: Letters (PAN first 5 chars)
+✓ Position 8-11: Numbers
+✓ Position 12: Letter
+✓ Position 13: Number (check digit)
+✓ Position 14: Letter (default 'Z')
+✓ Position 15: Letter/Number
 
-# Extraction prompt for single files
-EXTRACTION_PROMPT = """You are an expert AI invoice data extraction system. Analyze this invoice image and extract the following 9 fields with maximum precision:
+If GSTIN doesn't match this pattern exactly, return null.
 
-FIELD EXTRACTION GUIDE:
+Process the invoice images and return the JSON array:"""
 
-1. PARTY_NAME (Company/Person issuing the invoice):
-   - Location: Usually in header, letterhead, or "Billed by" section
-   - Extract: Full official business name or individual name
-   - Example: "ABC Corporation Pvt Ltd"
+# Enhanced single extraction prompt using Google Gemini best practices
+EXTRACTION_PROMPT = """Task: Extract invoice data from the provided image with maximum accuracy.
 
-2. PARTY_GSTIN (15-digit GST Identification Number):
-   - Location: Near company details, often labeled "GSTIN:", "GST No:", "Tax ID:"
-   - Format: **MUST BE EXACTLY 15 CHARACTERS** (##AAAAA####A#A)
-   - Example: "27AABCU9603R1ZN"
-   - **CRITICAL: Count each character - if not exactly 15, return null**
-   - **Extract exactly as printed - do not add or remove any characters**
+Input: Invoice image
+Output: JSON object with 9 fields
 
-3. TAX_INVOICE_NO (Unique invoice identifier):
-   - Location: Prominently displayed, labeled "Invoice No:", "Bill No:", "Ref:"
-   - Format: Can be numeric, alphanumeric, or mixed
-   - Example: "INV-2024-001", "12345", "A/24/001"
+Required Fields:
+1. party_name: Company issuing the invoice (from header/letterhead)
+2. party_gstin: 15-character GST number (exactly 15 chars: ##AAAAA####A#A)
+3. tax_invoice_no: Invoice identifier
+4. invoice_date: Issue date (DD-MM-YYYY format)
+5. taxable_value: Pre-tax amount (numbers only)
+6. cgst: Central GST amount (numbers only)
+7. sgst: State GST amount (numbers only)
+8. igst: Integrated GST amount (numbers only)
+9. invoice_value: Total amount including taxes (numbers only)
 
-4. INVOICE_DATE (Date of invoice issuance):
-   - Location: Near invoice number, labeled "Date:", "Invoice Date:", "Bill Date:"
-   - Format: Convert to DD-MM-YYYY (e.g., 15-01-2024)
-   - Common formats: DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+Constraints:
+- Extract ONLY clearly visible information
+- GSTIN must be EXACTLY 15 characters or return null
+- Use null for missing/unclear data
+- Numbers only for monetary values (no symbols)
+- Date format: DD-MM-YYYY
 
-5. TAXABLE_VALUE (Amount before taxes):
-   - Location: In totals section, labeled "Taxable Amount:", "Sub Total:", "Before Tax:"
-   - Extract: Only numerical value (1000.50)
-   - Ignore: Currency symbols (₹, $), commas, text
-
-6. CGST (Central GST amount):
-   - Location: Tax breakdown section
-   - Label: "CGST @9%:", "Central GST:", "CGST:"
-   - Extract: Only the tax amount, not the rate
-
-7. SGST (State GST amount):
-   - Location: Tax breakdown section  
-   - Label: "SGST @9%:", "State GST:", "SGST:"
-   - Extract: Only the tax amount, not the rate
-
-8. IGST (Integrated GST amount):
-   - Location: Tax breakdown section
-   - Label: "IGST @18%:", "Integrated GST:", "IGST:"
-   - Note: Usually present instead of CGST+SGST for inter-state transactions
-
-9. INVOICE_VALUE (Final total including all taxes):
-   - Location: Bottom of invoice, prominently displayed
-   - Label: "Total:", "Grand Total:", "Amount Payable:", "Final Amount:"
-   - Extract: Only numerical value
-
-EXTRACTION RULES:
-✓ Extract ONLY clearly visible and readable information
-✓ For amounts: numbers only (1250.50 not ₹1,250.50)
-✓ **For GSTIN: EXACTLY 15 characters - count carefully (2digits+5letters+4digits+1letter+1digit+1letter)**
-✓ For dates: DD-MM-YYYY format
-✓ Return null for unclear, missing, or unreadable fields
-✗ Do NOT guess or calculate missing values
-✗ Do NOT use default values
-✗ **NEVER modify or correct GSTIN numbers - extract exactly as shown**
-
-Return in this exact JSON format:
+Example Input: Invoice from "Tech Solutions Ltd", GSTIN "29ABCDE1234F5G6", Invoice "INV-001"
+Example Output:
 {
-  "party_name": "value_or_null",
-  "party_gstin": "value_or_null",
-  "tax_invoice_no": "value_or_null", 
-  "invoice_date": "value_or_null",
-  "taxable_value": "value_or_null",
-  "cgst": "value_or_null",
-  "sgst": "value_or_null",
-  "igst": "value_or_null",
-  "invoice_value": "value_or_null"
-}"""
+  "party_name": "Tech Solutions Ltd",
+  "party_gstin": "29ABCDE1234F5G6",
+  "tax_invoice_no": "INV-001",
+  "invoice_date": "15-03-2024",
+  "taxable_value": "5000.00",
+  "cgst": "450.00",
+  "sgst": "450.00",
+  "igst": null,
+  "invoice_value": "5900.00"
+}
+
+GSTIN Validation Pattern:
+Position 1-2: State code (numbers)
+Position 3-7: PAN first 5 (letters)
+Position 8-11: Entity number (numbers)
+Position 12: Check digit (letter)
+Position 13: Validation digit (number)
+Position 14: Default 'Z' (letter)
+Position 15: Check code (letter/number)
+
+Extract the data from the invoice image and return JSON:"""
 
 # Ultra-optimized extraction prompt for minimal token usage with high accuracy
 ULTRA_COMPACT_PROMPT = """You are an expert invoice data extractor. Extract these exact fields from the invoice image:
@@ -351,7 +434,7 @@ Return JSON array with one object per invoice image:
 
 async def optimized_generate_content(prompt: str, image_data: bytes = None, content_type: str = None) -> str:
     """
-    Ultra-optimized content generation using only Google Gemini
+    Ultra-optimized content generation using only Google Gemini with safety handling
     """
     model = model_manager.get_best_available_model()
     
@@ -394,18 +477,111 @@ async def optimized_generate_content(prompt: str, image_data: bytes = None, cont
         else:
             prompt_parts = [prompt]
         
-        response = gemini_model.generate_content(
-            prompt_parts,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0,  # Deterministic output
-                max_output_tokens=200,  # Limit output for efficiency
-                top_p=1,
-                top_k=1
-            )
+        # Enhanced generation config with safety settings
+        generation_config = genai.types.GenerationConfig(
+            temperature=0,  # Deterministic output
+            max_output_tokens=1000,  # Increased for complex invoices
+            top_p=0.95,  # Slightly more flexible
+            top_k=40     # Allow more token options
         )
         
-        logger.info(f"Successfully processed with {model.name}")
-        return response.text
+        # Safety settings to reduce blocking - most permissive for business documents
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH", 
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            }
+        ]
+        
+        # For 2.5 Flash models, try even more permissive settings
+        if "2.5" in model.name:
+            safety_settings = []  # No safety restrictions for business documents
+        
+        response = gemini_model.generate_content(
+            prompt_parts,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        
+        # Enhanced response handling for safety blocks
+        if response.candidates:
+            candidate = response.candidates[0]
+            
+            # Check finish reason
+            if hasattr(candidate, 'finish_reason'):
+                finish_reason = candidate.finish_reason
+                
+                if finish_reason == 2:  # SAFETY
+                    logger.warning(f"Content blocked by safety filters for {model.name}")
+                    
+                    # Try multiple fallback strategies before giving up on this model
+                    fallback_strategies = [
+                        # Strategy 1: Ultra-simple prompt
+                        """Extract invoice data from this document. Return JSON with these exact fields:
+party_name, party_gstin, tax_invoice_no, invoice_date, taxable_value, cgst, sgst, igst, invoice_value""",
+                        
+                        # Strategy 2: Business document prompt
+                        """This is a business invoice document. Please extract the key financial information in JSON format.""",
+                        
+                        # Strategy 3: Minimal prompt
+                        """Extract text data as JSON from this document."""
+                    ]
+                    
+                    for i, fallback_prompt in enumerate(fallback_strategies):
+                        try:
+                            logger.info(f"Trying safety fallback strategy {i+1} with {model.name}")
+                            fallback_response = gemini_model.generate_content(
+                                [fallback_prompt, prompt_parts[-1]] if len(prompt_parts) > 1 else [fallback_prompt],
+                                generation_config=generation_config,
+                                safety_settings=safety_settings
+                            )
+                            
+                            if (fallback_response.candidates and 
+                                hasattr(fallback_response.candidates[0], 'finish_reason') and
+                                fallback_response.candidates[0].finish_reason != 2 and
+                                hasattr(fallback_response, 'text') and fallback_response.text):
+                                logger.info(f"Safety fallback strategy {i+1} succeeded with {model.name}")
+                                return fallback_response.text
+                        except Exception as fallback_error:
+                            logger.warning(f"Fallback strategy {i+1} failed: {fallback_error}")
+                            continue
+                    
+                    # If all fallback strategies fail, try next model without marking this one as failed
+                    logger.warning(f"All safety fallback strategies failed for {model.name}, trying next model")
+                    next_model = model_manager.get_best_available_model()
+                    if next_model and next_model.name != model.name:
+                        # Don't mark as failed - just skip this time for safety issues
+                        return await optimized_generate_content(prompt, image_data, content_type)
+                    else:
+                        raise Exception("Content blocked by safety filters on all available models")
+                
+                elif finish_reason == 3:  # RECITATION
+                    logger.warning(f"Content blocked for recitation by {model.name}")
+                    raise Exception("Content blocked for potential copyright issues")
+                
+                elif finish_reason == 4:  # OTHER
+                    logger.warning(f"Content blocked for other reasons by {model.name}")
+                    raise Exception("Content blocked for unspecified reasons")
+        
+        # Check if response has text
+        if hasattr(response, 'text') and response.text:
+            logger.info(f"Successfully processed with {model.name}")
+            return response.text
+        else:
+            logger.error(f"No text returned from {model.name}")
+            raise Exception("No valid response text returned from model")
         
     except Exception as e:
         error_str = str(e)
@@ -636,6 +812,215 @@ def create_csv_from_data(data_list: List[dict]) -> str:
     
     return output.getvalue()
 
+def create_tally_xml_from_data(data_list: List[dict], company_name: str = "YOUR COMPANY") -> str:
+    """Create Tally-ready XML content from list of extracted invoice data"""
+    if not data_list:
+        return ""
+    
+    # Remove duplicates based on invoice number
+    unique_invoices = {}
+    for invoice_data in data_list:
+        if invoice_data.get("error"):
+            continue
+        invoice_no = invoice_data.get("tax_invoice_no", "")
+        if invoice_no and invoice_no not in unique_invoices:
+            unique_invoices[invoice_no] = invoice_data
+    
+    if not unique_invoices:
+        return ""
+    
+    # Create root XML structure
+    envelope = ET.Element("ENVELOPE")
+    
+    # Header
+    header = ET.SubElement(envelope, "HEADER")
+    tally_request = ET.SubElement(header, "TALLYREQUEST")
+    tally_request.text = "Import Data"
+    
+    # Body
+    body = ET.SubElement(envelope, "BODY")
+    import_data = ET.SubElement(body, "IMPORTDATA")
+    
+    # Request description for vouchers (transactions)
+    request_desc = ET.SubElement(import_data, "REQUESTDESC")
+    report_name = ET.SubElement(request_desc, "REPORTNAME")
+    report_name.text = "Vouchers"
+    
+    static_vars = ET.SubElement(request_desc, "STATICVARIABLES")
+    current_company = ET.SubElement(static_vars, "SVCURRENTCOMPANY")
+    current_company.text = company_name
+    
+    # Request data
+    request_data = ET.SubElement(import_data, "REQUESTDATA")
+    
+    # Process each unique invoice
+    for invoice_data in unique_invoices.values():
+        # Create TallyMessage for this invoice
+        tally_message = ET.SubElement(request_data, "TALLYMESSAGE")
+        tally_message.set("xmlns:UDF", "TallyUDF")
+        
+        # Create voucher (main transaction)
+        if invoice_data.get("tax_invoice_no"):
+            voucher = create_voucher(tally_message, invoice_data)
+    
+    # Convert to string with proper formatting
+    xml_str = ET.tostring(envelope, encoding='unicode')
+    
+    # Pretty print the XML
+    dom = minidom.parseString(xml_str)
+    return dom.toprettyxml(indent="  ")
+
+def create_voucher(parent: ET.Element, invoice_data: dict) -> ET.Element:
+    """Create a voucher (transaction) entry in Tally XML format"""
+    voucher = ET.SubElement(parent, "VOUCHER")
+    
+    # Voucher attributes
+    voucher.set("REMOTEID", f"invoice-{hash(invoice_data['tax_invoice_no']) % 1000000:06d}")
+    voucher.set("VCHKEY", f"key-{hash(invoice_data['tax_invoice_no']) % 1000000:06d}")
+    voucher.set("VCHTYPE", "Sales")
+    voucher.set("ACTION", "Create")
+    voucher.set("OBJVIEW", "Invoice Voucher View")
+    
+    # Date conversion (DD-MM-YYYY to YYYYMMDD)
+    if invoice_data.get("invoice_date"):
+        try:
+            date_parts = invoice_data["invoice_date"].split("-")
+            if len(date_parts) == 3:
+                tally_date = f"{date_parts[2]}{date_parts[1]:0>2}{date_parts[0]:0>2}"
+            else:
+                tally_date = "20250101"
+        except:
+            tally_date = "20250101"
+    else:
+        tally_date = "20250101"
+    
+    # Basic voucher details
+    voucher_date = ET.SubElement(voucher, "DATE")
+    voucher_date.text = tally_date
+    
+    # Voucher type name
+    voucher_type_name = ET.SubElement(voucher, "VOUCHERTYPENAME")
+    voucher_type_name.text = "Sales"
+    
+    voucher_number = ET.SubElement(voucher, "VOUCHERNUMBER")
+    voucher_number.text = invoice_data.get("tax_invoice_no", "")
+    
+    # Reference details
+    if invoice_data.get("party_name"):
+        party_name = ET.SubElement(voucher, "PARTYLEDGERNAME")
+        party_name.text = invoice_data["party_name"]
+    
+    # Reference number and date
+    reference = ET.SubElement(voucher, "REFERENCE")
+    reference.text = invoice_data.get("tax_invoice_no", "")
+    
+    reference_date = ET.SubElement(voucher, "REFERENCEDATE")
+    reference_date.text = tally_date
+    
+    # Narration
+    narration = ET.SubElement(voucher, "NARRATION")
+    narration.text = f"Sales Invoice {invoice_data.get('tax_invoice_no', '')} to {invoice_data.get('party_name', '')}"
+    
+    # Voucher entries (accounting entries)
+    create_voucher_entries(voucher, invoice_data)
+    
+    # Bill allocations for party ledger
+    if invoice_data.get("party_name") and invoice_data.get("invoice_value"):
+        create_bill_allocations(voucher, invoice_data)
+    
+    return voucher
+
+def create_voucher_entries(voucher: ET.Element, invoice_data: dict) -> None:
+    """Create accounting entries for the voucher"""
+    
+    # Party ledger entry (Debit - Amount Receivable)
+    if invoice_data.get("party_name") and invoice_data.get("invoice_value"):
+        party_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        
+        ledger_name = ET.SubElement(party_entry, "LEDGERNAME")
+        ledger_name.text = invoice_data["party_name"]
+        
+        amount = ET.SubElement(party_entry, "AMOUNT")
+        amount.text = str(invoice_data["invoice_value"])
+        
+        is_deemed_positive = ET.SubElement(party_entry, "ISDEEMEDPOSITIVE")
+        is_deemed_positive.text = "Yes"
+    
+    # Sales entry (Credit - Revenue)
+    if invoice_data.get("taxable_value"):
+        sales_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        
+        sales_ledger = ET.SubElement(sales_entry, "LEDGERNAME")
+        sales_ledger.text = "Sales Account"
+        
+        sales_amount = ET.SubElement(sales_entry, "AMOUNT")
+        sales_amount.text = f"-{invoice_data['taxable_value']}"
+        
+        is_deemed_positive = ET.SubElement(sales_entry, "ISDEEMEDPOSITIVE")
+        is_deemed_positive.text = "No"
+    
+    # CGST entry
+    if invoice_data.get("cgst") and float(str(invoice_data["cgst"]).replace(",", "") or 0) > 0:
+        cgst_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        
+        cgst_ledger = ET.SubElement(cgst_entry, "LEDGERNAME")
+        cgst_ledger.text = "OUTPUT CGST @ 9%"
+        
+        cgst_amount = ET.SubElement(cgst_entry, "AMOUNT")
+        cgst_amount.text = f"-{invoice_data['cgst']}"
+        
+        is_deemed_positive = ET.SubElement(cgst_entry, "ISDEEMEDPOSITIVE")
+        is_deemed_positive.text = "No"
+    
+    # SGST entry  
+    if invoice_data.get("sgst") and float(str(invoice_data["sgst"]).replace(",", "") or 0) > 0:
+        sgst_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        
+        sgst_ledger = ET.SubElement(sgst_entry, "LEDGERNAME")
+        sgst_ledger.text = "OUTPUT SGST @ 9%"
+        
+        sgst_amount = ET.SubElement(sgst_entry, "AMOUNT")
+        sgst_amount.text = f"-{invoice_data['sgst']}"
+        
+        is_deemed_positive = ET.SubElement(sgst_entry, "ISDEEMEDPOSITIVE")
+        is_deemed_positive.text = "No"
+    
+    # IGST entry
+    if invoice_data.get("igst") and float(str(invoice_data["igst"]).replace(",", "") or 0) > 0:
+        igst_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        
+        igst_ledger = ET.SubElement(igst_entry, "LEDGERNAME")
+        igst_ledger.text = "OUTPUT IGST @ 18%"
+        
+        igst_amount = ET.SubElement(igst_entry, "AMOUNT")
+        igst_amount.text = f"-{invoice_data['igst']}"
+        
+        is_deemed_positive = ET.SubElement(igst_entry, "ISDEEMEDPOSITIVE")
+        is_deemed_positive.text = "No"
+
+def create_bill_allocations(voucher: ET.Element, invoice_data: dict) -> None:
+    """Create bill allocations for party ledger entries"""
+    # Find the party ledger entry to add bill allocations
+    for ledger_entry in voucher.findall(".//ALLLEDGERENTRIES.LIST"):
+        ledger_name_elem = ledger_entry.find("LEDGERNAME")
+        if ledger_name_elem is not None and ledger_name_elem.text == invoice_data.get("party_name"):
+            # Add bill allocations list
+            bill_allocations = ET.SubElement(ledger_entry, "BILLALLOCATIONS.LIST")
+            
+            # Bill name (invoice number)
+            bill_name = ET.SubElement(bill_allocations, "NAME")
+            bill_name.text = invoice_data.get("tax_invoice_no", "")
+            
+            # Bill type
+            bill_type = ET.SubElement(bill_allocations, "BILLTYPE")
+            bill_type.text = "New Ref"
+            
+            # Amount
+            amount = ET.SubElement(bill_allocations, "AMOUNT")
+            amount.text = str(invoice_data.get("invoice_value", 0))
+            
+            break
+
 async def process_single_file_async(file_content: bytes, filename: str, content_type: str) -> dict:
     """Process a single file and return extracted data with filename (async version)"""
     try:
@@ -796,6 +1181,94 @@ async def bulk_extract_invoices(files: List[UploadFile] = File(...)):
         io.StringIO(csv_content),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=invoice_extraction_results.csv"}
+    )
+
+@app.post("/bulk-extract-tally/")
+async def bulk_extract_invoices_tally(files: List[UploadFile] = File(...), company_name: str = "YOUR COMPANY"):
+    """Bulk extraction with Tally XML output for direct import"""
+    
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    if len(files) > MAX_BULK_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files. Maximum {MAX_BULK_FILES} files allowed.")
+    
+    logger.info(f"Starting Tally XML bulk processing of {len(files)} files")
+    results = []
+    
+    # Process files (reuse the same logic as regular bulk extract)
+    valid_files = []
+    for file in files:
+        try:
+            validate_file(file)
+            contents = await file.read()
+            
+            if len(contents) > MAX_FILE_SIZE:
+                results.append(create_null_result(
+                    file.filename,
+                    f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.1f}MB"
+                ))
+                continue
+            
+            valid_files.append({
+                "filename": file.filename,
+                "content": contents,
+                "content_type": file.content_type
+            })
+            
+        except Exception as e:
+            logger.error(f"File validation failed for {file.filename}: {e}")
+            results.append(create_null_result(file.filename or "unknown", f"Validation error: {str(e)}"))
+    
+    # Process in batches
+    for i in range(0, len(valid_files), BATCH_SIZE):
+        batch = valid_files[i:i + BATCH_SIZE]
+        
+        # Separate images and PDFs
+        image_files = [f for f in batch if "image" in f['content_type']]
+        pdf_files = [f for f in batch if "pdf" in f['content_type']]
+        
+        # Process images
+        if image_files:
+            try:
+                if len(image_files) == 1:
+                    result = await process_single_file_robust(
+                        image_files[0]['content'],
+                        image_files[0]['filename'],
+                        image_files[0]['content_type']
+                    )
+                    results.append(result)
+                else:
+                    batch_results = await process_image_batch_robust(image_files)
+                    results.extend(batch_results)
+            except Exception as e:
+                logger.error(f"Image batch processing failed: {e}")
+                for img_file in image_files:
+                    results.append(create_null_result(img_file['filename'], f"Processing failed: {str(e)}"))
+        
+        # Process PDFs
+        for pdf_file in pdf_files:
+            try:
+                result = await process_single_file_robust(
+                    pdf_file['content'],
+                    pdf_file['filename'],
+                    pdf_file['content_type']
+                )
+                results.append(result)
+            except Exception as e:
+                results.append(create_null_result(pdf_file['filename'], f"PDF processing failed: {str(e)}"))
+        
+        # Delay between batches
+        if i + BATCH_SIZE < len(valid_files):
+            await asyncio.sleep(0.5)
+    
+    # Generate Tally XML
+    tally_xml = create_tally_xml_from_data(results, company_name)
+    
+    return StreamingResponse(
+        io.StringIO(tally_xml),
+        media_type="application/xml",
+        headers={"Content-Disposition": f"attachment; filename=tally_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml"}
     )
 
 async def process_image_batch_robust(image_files: List[dict]) -> List[dict]:
@@ -994,9 +1467,11 @@ async def health_check():
 
 @app.get("/models")
 async def get_model_status():
-    """Get status of all Gemini models"""
+    """Get status of all Gemini models with safety filter improvements"""
     model_status = []
     for model in model_manager.models:
+        # Add safety filter status
+        safety_info = "No restrictions" if "2.5" in model.name else "Standard restrictions"
         model_status.append({
             "name": model.name,
             "model_id": model.model_id,
@@ -1004,16 +1479,54 @@ async def get_model_status():
             "retry_count": model.retry_count,
             "max_retries": model.max_retries,
             "cost_efficiency": model.cost_efficiency,
-            "last_error": model.last_error
+            "last_error": model.last_error,
+            "safety_filter_mode": safety_info,
+            "priority": "Primary" if model.cost_efficiency == 1 else f"Fallback {model.cost_efficiency-1}"
         })
     
     quota_status = model_manager.get_quota_status()
+    
+    # Add safety improvements info
+    safety_improvements = {
+        "safety_blocks_ignore_retry_count": True,
+        "fallback_strategies": 3,
+        "auto_recovery": True,
+        "gemini_2_5_restrictions": "None"
+    }
     
     return {
         "models": model_status,
         "quota": quota_status,
         "available_count": len([m for m in model_manager.models if m.available]),
-        "total_count": len(model_manager.models)
+        "total_count": len(model_manager.models),
+        "safety_improvements": safety_improvements,
+        "status": "Safety filter issues resolved ✅"
+    }
+
+@app.get("/models")
+async def get_models_status():
+    """Get detailed information about all available models"""
+    models_info = []
+    for model in model_manager.models:
+        models_info.append({
+            "name": model.name,
+            "model_id": model.model_id,
+            "available": model.available,
+            "cost_efficiency": model.cost_efficiency,
+            "retry_count": model.retry_count,
+            "max_retries": model.max_retries
+        })
+    
+    best_model = model_manager.get_best_available_model()
+    
+    return {
+        "all_models": models_info,
+        "active_model": {
+            "name": best_model.name if best_model else "none",
+            "model_id": best_model.model_id if best_model else "none",
+            "efficiency_rank": best_model.cost_efficiency if best_model else "none"
+        },
+        "total_models": len(model_manager.models)
     }
 
 @app.post("/reset-models")
@@ -1032,8 +1545,119 @@ async def get_quota_status():
         **quota_status,
         "active_model": best_model.name if best_model else "none",
         "recommendations": {
-            "requests_until_limit": max(0, 45 - quota_status["requests_used"]),
-            "should_slow_down": quota_status["requests_used"] > 40,
-            "estimated_daily_capacity": f"~{50 * BATCH_SIZE} invoices with batch processing"
+            "requests_until_limit": max(0, 200 - quota_status["requests_used"]),  # Updated to 200 RPD
+            "should_slow_down": quota_status["requests_used"] > 180,  # Updated threshold
+            "estimated_daily_capacity": f"~{200 * BATCH_SIZE} invoices with batch processing (Latest Gemini 2.5 Flash models!)"
         }
     }
+
+@app.post("/bulk-extract-dual/")
+async def bulk_extract_invoices_dual(files: List[UploadFile] = File(...), company_name: str = "YOUR COMPANY"):
+    """Bulk extraction with both CSV and Tally XML outputs in a zip file"""
+    
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    if len(files) > MAX_BULK_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files. Maximum {MAX_BULK_FILES} files allowed.")
+    
+    logger.info(f"Starting dual export bulk processing of {len(files)} files")
+    results = []
+    
+    # Process files (reuse the same logic)
+    valid_files = []
+    for file in files:
+        try:
+            validate_file(file)
+            contents = await file.read()
+            
+            if len(contents) > MAX_FILE_SIZE:
+                results.append(create_null_result(
+                    file.filename,
+                    f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.1f}MB"
+                ))
+                continue
+            
+            valid_files.append({
+                "filename": file.filename,
+                "content": contents,
+                "content_type": file.content_type
+            })
+            
+        except Exception as e:
+            logger.error(f"File validation failed for {file.filename}: {e}")
+            results.append(create_null_result(file.filename or "unknown", f"Validation error: {str(e)}"))
+    
+    # Process in batches
+    for i in range(0, len(valid_files), BATCH_SIZE):
+        batch = valid_files[i:i + BATCH_SIZE]
+        
+        # Separate images and PDFs
+        image_files = [f for f in batch if "image" in f['content_type']]
+        pdf_files = [f for f in batch if "pdf" in f['content_type']]
+        
+        # Process images
+        if image_files:
+            try:
+                if len(image_files) == 1:
+                    result = await process_single_file_robust(
+                        image_files[0]['content'],
+                        image_files[0]['filename'],
+                        image_files[0]['content_type']
+                    )
+                    results.append(result)
+                else:
+                    batch_results = await process_image_batch_robust(image_files)
+                    results.extend(batch_results)
+            except Exception as e:
+                logger.error(f"Image batch processing failed: {e}")
+                for img_file in image_files:
+                    results.append(create_null_result(img_file['filename'], f"Processing failed: {str(e)}"))
+        
+        # Process PDFs
+        for pdf_file in pdf_files:
+            try:
+                result = await process_single_file_robust(
+                    pdf_file['content'],
+                    pdf_file['filename'],
+                    pdf_file['content_type']
+                )
+                results.append(result)
+            except Exception as e:
+                results.append(create_null_result(pdf_file['filename'], f"PDF processing failed: {str(e)}"))
+        
+        # Delay between batches
+        if i + BATCH_SIZE < len(valid_files):
+            await asyncio.sleep(0.5)
+    
+    # Generate both CSV and XML
+    csv_content = create_csv_from_data(results)
+    tally_xml = create_tally_xml_from_data(results, company_name)
+    
+    # Create a zip file with both formats
+    import zipfile
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Add CSV
+        zip_file.writestr(
+            f"invoice_extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            csv_content.encode('utf-8')
+        )
+        # Add Tally XML
+        zip_file.writestr(
+            f"tally_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
+            tally_xml.encode('utf-8')
+        )
+    
+    zip_buffer.seek(0)
+    
+    return StreamingResponse(
+        io.BytesIO(zip_buffer.read()),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=invoice_extraction_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

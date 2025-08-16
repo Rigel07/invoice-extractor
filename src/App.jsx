@@ -6,9 +6,15 @@ function App() {
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [extractedData, setExtractedData] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStates, setLoadingStates] = useState({
+    csv: false,
+    xml: false,
+    dual: false
+  });
   const [error, setError] = useState(null);
   const [copyButtonText, setCopyButtonText] = useState('Copy as JSON');
   const [isDragOver, setIsDragOver] = useState(false);
+  const [companyName, setCompanyName] = useState('YOUR COMPANY');
 
   const handleFileChange = (event) => {
     setSelectedFiles(Array.from(event.target.files));
@@ -108,31 +114,8 @@ function App() {
           setError("Invalid response from API.");
         }
       } else {
-        // Multiple files upload
-        const formData = new FormData();
-        selectedFiles.forEach(file => {
-          formData.append('files', file);
-        });
-
-        const response = await axios.post("http://127.0.0.1:8000/bulk-extract/", formData, {
-          responseType: 'blob', // Important for file download
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          }
-        });
-
-        // Create download link for CSV file
-        const blob = new Blob([response.data], { type: 'text/csv' });
-        const url = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.setAttribute('download', 'invoice_extraction_results.csv');
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.URL.revokeObjectURL(url);
-
-        setExtractedData({ message: `Processed ${selectedFiles.length} files. CSV downloaded.` });
+        // Multiple files upload - default to CSV
+        await handleBulkUpload('csv');
       }
     } catch (err) {
       const errorMessage = err.response?.data?.detail || "An error occurred during extraction.";
@@ -140,6 +123,72 @@ function App() {
       console.error("Upload Error:", err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleBulkUpload = async (format = 'csv') => {
+    if (selectedFiles.length === 0) {
+      setError('Please select at least one file first');
+      return;
+    }
+
+    // Set loading state for specific button
+    setLoadingStates(prev => ({ ...prev, [format]: true }));
+    setError(null);
+    setExtractedData(null);
+
+    try {
+      const formData = new FormData();
+      selectedFiles.forEach(file => {
+        formData.append('files', file);
+      });
+
+      let endpoint = "http://127.0.0.1:8000/bulk-extract/";
+      let downloadFileName = 'invoice_extraction_results.csv';
+      let responseType = 'blob';
+
+      if (format === 'xml') {
+        endpoint = "http://127.0.0.1:8000/bulk-extract-tally/";
+        formData.append('company_name', companyName);
+        downloadFileName = `tally_import_${new Date().toISOString().slice(0,19).replace(/[-:]/g, '').replace('T', '_')}.xml`;
+      } else if (format === 'dual') {
+        endpoint = "http://127.0.0.1:8000/bulk-extract-dual/";
+        formData.append('company_name', companyName);
+        downloadFileName = `invoice_extraction_complete_${new Date().toISOString().slice(0,19).replace(/[-:]/g, '').replace('T', '_')}.zip`;
+      }
+
+      const response = await axios.post(endpoint, formData, {
+        responseType: responseType,
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        }
+      });
+
+      // Create download link
+      const blob = new Blob([response.data], { 
+        type: format === 'dual' ? 'application/zip' : 
+              format === 'xml' ? 'application/xml' : 'text/csv' 
+      });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', downloadFileName);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+
+      const formatLabel = format === 'csv' ? 'CSV' : 
+                         format === 'xml' ? 'Tally XML' : 
+                         'CSV + Tally XML (ZIP)';
+      setExtractedData({ message: `Processed ${selectedFiles.length} files. ${formatLabel} downloaded.` });
+    } catch (err) {
+      const errorMessage = err.response?.data?.detail || "An error occurred during extraction.";
+      setError(errorMessage);
+      console.error("Bulk Upload Error:", err);
+    } finally {
+      // Reset loading state for specific button
+      setLoadingStates(prev => ({ ...prev, [format]: false }));
     }
   };
 
@@ -246,14 +295,55 @@ function App() {
         )}
 
         {selectedFiles.length > 0 && (
-          <button className="btn" onClick={handleUpload} disabled={isLoading}>
-            {isLoading 
-              ? 'Processing...' 
-              : selectedFiles.length === 1 
-                ? 'Extract Details' 
-                : 'Extract All & Download CSV'
-            }
-          </button>
+          <div className="button-group">
+            {selectedFiles.length === 1 ? (
+              // Single file - just extract details
+              <button className="btn btn-primary" onClick={handleUpload} disabled={isLoading}>
+                {isLoading ? 'Processing...' : 'Extract Details'}
+              </button>
+            ) : (
+              // Multiple files - show export format options
+              <>
+                <div className="company-name-input">
+                  <label htmlFor="companyName">Company Name for Tally XML:</label>
+                  <input
+                    type="text"
+                    id="companyName"
+                    value={companyName}
+                    onChange={(e) => setCompanyName(e.target.value)}
+                    placeholder="Enter your company name"
+                    disabled={Object.values(loadingStates).some(loading => loading)}
+                  />
+                </div>
+                
+                <div className="export-buttons">
+                  <button 
+                    className="btn btn-primary" 
+                    onClick={() => handleBulkUpload('csv')} 
+                    disabled={Object.values(loadingStates).some(loading => loading)}
+                  >
+                    {loadingStates.csv ? 'Processing...' : 'Download CSV'}
+                  </button>
+                  
+                  <button 
+                    className="btn btn-primary" 
+                    onClick={() => handleBulkUpload('xml')} 
+                    disabled={Object.values(loadingStates).some(loading => loading)}
+                  >
+                    {loadingStates.xml ? 'Processing...' : 'Download Tally XML'}
+                  </button>
+                  
+                  <button 
+                    className="btn btn-info" 
+                    onClick={() => handleBulkUpload('dual')} 
+                    disabled={Object.values(loadingStates).some(loading => loading)}
+                  >
+                    {loadingStates.dual ? 'Processing...' : 'Download Both (ZIP)'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         )}
 
         {/* Bootstrap-style Alerts - positioned right after the button */}
