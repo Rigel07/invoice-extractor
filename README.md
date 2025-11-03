@@ -1,4 +1,4 @@
-# 🧾 Invoice Extractor Pro
+# 🧾 Invoice Extractor
 
 AI-powered invoice processing application that extracts data from invoice images and generates Tally-compatible XML files.
 
@@ -9,7 +9,6 @@ AI-powered invoice processing application that extracts data from invoice images
 - **Transaction Types**: Supports both Sales and Purchase invoice processing
 - **Tally Integration**: Generates clean XML files that import seamlessly into TallyPrime
 - **Batch Processing**: Handle multiple invoices simultaneously with real-time progress tracking
-- **Smart Caching**: Redis-based caching with bypass option to reduce AI API costs
 
 ## Quick Start
 
@@ -34,7 +33,6 @@ cp .env.example .env
 
 Required variables:
 - `GOOGLE_API_KEY`: Your Google Gemini AI API key
-- `REDIS_URL`: Redis connection string
 
 ### 3. Run the Application
 
@@ -55,9 +53,9 @@ Visit `http://localhost:5173` to use the application.
 - **Frontend**: React + Vite
 - **Backend**: FastAPI + Python
 - **AI**: Google Gemini
-- **Cache**: Redis
 - **Output**: Tally XML + CSV
 
 ## Documentation
 
-See `DEVELOPMENT_NOTES.md` for comprehensive technical documentation and implementation details.
+
+See `dev_context.md` for comprehensive technical documentation and implementation details.
