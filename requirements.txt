@@ -1,0 +1,25 @@
+# 🧾 Invoice Extractor Pro - Essential Requirements
+# ================================================
+
+# Core FastAPI and async web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+pydantic==2.4.2
+
+# Image processing and AI
+Pillow==10.0.1
+google-genai
+
+# Environment variables
+python-dotenv==1.0.0
+
+# CORS for React frontend
+fastapi[all]==0.104.1
+
+# Production WSGI server
+gunicorn==21.2.0
+
+# Development and testing (optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
